@@ -678,6 +678,7 @@ if (_chatSettingsEl) _chatSettingsEl.addEventListener('click', () => {
     const autoToggle = document.getElementById('auto-send-toggle');
     if (autoToggle) autoToggle.classList.toggle('active', !!settings.autoSendEnabled);
     updateAutoSendUI();
+    if (typeof updateCombineCardsUI === 'function') updateCombineCardsUI(); // 每次打开设置都重新刷新一次，跟"主动发消息"那个开关同样的做法，避免显示的还是网页刚启动、设置数据还没读完时的旧状态
     updateDelayUI();
     const immToggle = document.getElementById('immersive-toggle');
     if (immToggle) immToggle.classList.toggle('active', document.body.classList.contains('immersive-mode'));
@@ -1533,6 +1534,45 @@ autoSendSlider.addEventListener('input', (e) => {
     autoSendValue.textContent = `${val}分钟`;
 });
 
+const combineCardsToggle  = document.getElementById('combine-cards-toggle');
+const combineCardsControl = document.getElementById('combine-cards-control');
+const combineCardsSlider  = document.getElementById('combine-cards-slider');
+const combineCardsValue   = document.getElementById('combine-cards-value');
+
+const updateCombineCardsUI = () => {
+    const on = !!settings.combineReplyCards;
+    combineCardsToggle.classList.toggle('active', on);
+    combineCardsSlider.disabled = !on;
+    combineCardsControl.style.opacity = on ? '1' : '0.4';
+    combineCardsControl.style.pointerEvents = on ? 'auto' : 'none';
+    const currentVal = settings.combineReplyMaxCards || 3;
+    combineCardsSlider.value = currentVal;
+    combineCardsValue.textContent = `${currentVal}句`;
+};
+
+updateCombineCardsUI();
+
+combineCardsToggle.addEventListener('click', () => {
+    settings.combineReplyCards = !settings.combineReplyCards;
+    updateCombineCardsUI();
+    // 开关这种一次性点击的操作，不能用"等0.5秒再存"的节流保存——万一点完立刻退出网页，
+    // 这0.5秒还没到就直接白点了，等于没保存。改成点了立刻存，不等待
+    if (typeof saveData === 'function') {
+        try {
+            const p = saveData();
+            if (p && typeof p.catch === 'function') p.catch(e => console.error('[回复拼接字卡] 保存失败:', e));
+        } catch (e) { console.error('[回复拼接字卡] 保存失败:', e); }
+    }
+    showNotification(`回复拼接字卡已${settings.combineReplyCards ? '开启' : '关闭'}`, 'success');
+});
+
+combineCardsSlider.addEventListener('input', (e) => {
+    const val = parseInt(e.target.value);
+    settings.combineReplyMaxCards = val;
+    combineCardsValue.textContent = `${val}句`;
+});
+combineCardsSlider.addEventListener('change', throttledSaveData);
+
 autoSendSlider.addEventListener('change', () => {
     manageAutoSendTimer(); 
     throttledSaveData();
@@ -1551,6 +1591,24 @@ autoSendSlider.addEventListener('change', () => {
 
 
         function initNewFeatureListeners() {
+            const periodEntry = document.getElementById('period-function');
+            if (periodEntry) {
+                periodEntry.addEventListener('click', () => {
+                    hideModal(DOMElements.advancedModal.modal);
+                    showModal(document.getElementById('period-modal'));
+                    if (typeof window._pdInit === 'function') window._pdInit();
+                });
+            }
+
+            // Step 2：入口改成先打开历史列表页，"+"里再选"问梦角"打开创建弹窗
+            const surveyEntry = document.getElementById('survey-function');
+            if (surveyEntry) {
+                surveyEntry.addEventListener('click', () => {
+                    hideModal(DOMElements.advancedModal.modal);
+                    if (typeof window._surveyOpenListModal === 'function') window._surveyOpenListModal();
+                });
+            }
+
             const flEntry = document.getElementById('fortune-lenormand-function');
             if (flEntry) {
                 flEntry.addEventListener('click', () => {
@@ -2644,6 +2702,67 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
     const cancelAddSongBtn = document.getElementById('cancel-add-song');
     const modalTitleElem = addSongModal.querySelector('.modal-title span');
 
+    // ── 本地音频文件上传（走云端存储，跟"更换头像"这些走的是同一套 CloudMedia） ──
+    const musicLocalFileInput = document.getElementById('new-song-file');
+    const musicLocalUploadLabel = document.getElementById('music-local-upload-label');
+    const musicLocalClearBtn = document.getElementById('music-local-clear-btn');
+    const musicLocalFilenameEl = document.getElementById('music-local-filename');
+    const musicLocalHintEl = document.getElementById('music-local-hint');
+    let _pendingLocalFile = null;      // 选中但还没确认添加的本地文件
+    let _editingCloudUrl = null;       // 编辑模式下，原来就是云端引用的url（避免被误当成普通链接改掉）
+
+    function _cloudReady() {
+        return !!(window.CloudSync && typeof window.CloudSync.isConnected === 'function' && window.CloudSync.isConnected());
+    }
+
+    function _updateLocalUploadAvailability() {
+        const ready = _cloudReady();
+        musicLocalUploadLabel.classList.toggle('disabled', !ready);
+        musicLocalFileInput.disabled = !ready;
+        musicLocalHintEl.classList.toggle('is-blocked', !ready);
+        musicLocalHintEl.textContent = ready
+            ? '选择本地音频文件后会上传到云端存储'
+            : '未配置云端存储，本地音频上传不可用';
+    }
+
+    function _resetLocalUploadUI() {
+        _pendingLocalFile = null;
+        _editingCloudUrl = null;
+        musicLocalFileInput.value = '';
+        musicLocalFilenameEl.textContent = '';
+        musicLocalClearBtn.style.display = 'none';
+        newSongUrl.disabled = false;
+        newSongUrl.style.opacity = '';
+        _updateLocalUploadAvailability();
+    }
+
+    musicLocalFileInput.addEventListener('change', () => {
+        const file = musicLocalFileInput.files && musicLocalFileInput.files[0];
+        if (!file) return;
+        _pendingLocalFile = file;
+        _editingCloudUrl = null; // 重新选了本地文件，之前编辑时带着的旧云端引用不再需要
+        musicLocalFilenameEl.textContent = '已选择：' + file.name;
+        musicLocalClearBtn.style.display = 'flex';
+        // 链接框跟着变灰禁用，避免同时填两种搞混
+        newSongUrl.value = '';
+        newSongUrl.disabled = true;
+        newSongUrl.style.opacity = '0.5';
+        // 歌名没填的话，顺手用文件名（去掉后缀）帮着填一下
+        if (!newSongTitle.value.trim()) {
+            newSongTitle.value = file.name.replace(/\.[^.]+$/, '');
+        }
+    });
+
+    musicLocalClearBtn.addEventListener('click', () => {
+        _pendingLocalFile = null;
+        _editingCloudUrl = null;
+        musicLocalFileInput.value = '';
+        musicLocalFilenameEl.textContent = '';
+        musicLocalClearBtn.style.display = 'none';
+        newSongUrl.disabled = false;
+        newSongUrl.style.opacity = '';
+    });
+
     let currentIndex = 0;
     let isPlaying = false;
     let playMode = 'sequence';
@@ -2651,7 +2770,14 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
     let searchTerm = '';
     let isSearchVisible = false;
 
-    function loadSong(index) {
+    function _markPlaying(playing) {
+        isPlaying = playing;
+        document.getElementById('icon-play').style.display = playing ? 'none' : 'block';
+        document.getElementById('icon-pause').style.display = playing ? 'block' : 'none';
+        player.classList.toggle('playing', playing);
+    }
+
+    function loadSong(index, forcePlay) {
         if (songs.length === 0) return;
         if (index >= songs.length) index = 0;
         if (index < 0) index = songs.length - 1;
@@ -2659,8 +2785,25 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
         const song = songs[index];
         document.getElementById('music-title').innerText = song.title;
         document.getElementById('music-subtitle').innerText = song.sub;
-        
-        if (song.url) audio.src = song.url;
+
+        const isCloud = window.CloudMedia && window.CloudMedia.isCloudRef && window.CloudMedia.isCloudRef(song.url);
+        if (isCloud) {
+            // 云端引用要先解析成真实可播放的地址，这一步是异步的——
+            // 不能像本地链接那样直接同步赋值给 audio.src
+            window.CloudMedia.fetchUrl(song.url).then((blobUrl) => {
+                audio.src = blobUrl;
+                if (forcePlay || isPlaying) {
+                    audio.play().then(() => _markPlaying(true)).catch(() => {});
+                }
+            }).catch((e) => {
+                showNotification('云端音频加载失败：' + (e && e.message || e), 'error');
+            });
+        } else if (song.url) {
+            audio.src = song.url;
+            if (forcePlay || isPlaying) {
+                audio.play().then(() => _markPlaying(true)).catch(() => {});
+            }
+        }
         updatePlaylistHighlight();
     }
 
@@ -2671,18 +2814,12 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
         }
         if (isPlaying) {
             audio.pause();
-            isPlaying = false;
-            document.getElementById('icon-play').style.display = 'block';
-            document.getElementById('icon-pause').style.display = 'none';
-            player.classList.remove('playing');
+            _markPlaying(false);
         } else {
             const playPromise = audio.play();
             if (playPromise !== undefined) {
                 playPromise.then(_ => {
-                    isPlaying = true;
-                    document.getElementById('icon-play').style.display = 'none';
-                    document.getElementById('icon-pause').style.display = 'block';
-                    player.classList.add('playing');
+                    _markPlaying(true);
                 }).catch(error => {
                     console.error(error);
                     showNotification('播放失败，请检查网络或链接是否有效', 'error');
@@ -2697,14 +2834,12 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
         else if (playMode === 'shuffle') currentIndex = Math.floor(Math.random() * songs.length);
         else currentIndex = (currentIndex + 1) % songs.length;
         if (playMode !== 'single') loadSong(currentIndex);
-        if (isPlaying) audio.play();
     }
 
     function prevSong() {
         if (songs.length === 0) return;
         currentIndex = (currentIndex - 1 + songs.length) % songs.length;
         loadSong(currentIndex);
-        if (isPlaying) audio.play();
     }
 
     function savePlaylist() {
@@ -2721,7 +2856,19 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
         editModeIndex = index;
         newSongTitle.value = song.title;
         newSongSub.value = song.sub;
-        newSongUrl.value = song.url;
+        _resetLocalUploadUI();
+        const isCloud = window.CloudMedia && window.CloudMedia.isCloudRef && window.CloudMedia.isCloudRef(song.url);
+        if (isCloud) {
+            // 这首歌原来就是本地上传的，链接框留空、灰掉，用文件名提示区显示状态，
+            // 不要把 oss:// 这种内部引用当成普通链接显示出来
+            _editingCloudUrl = song.url;
+            newSongUrl.value = '';
+            newSongUrl.disabled = true;
+            newSongUrl.style.opacity = '0.5';
+            musicLocalFilenameEl.textContent = '当前使用：已上传的本地音频文件（重新选择可替换）';
+        } else {
+            newSongUrl.value = song.url;
+        }
         modalTitleElem.innerText = "编辑歌曲信息";
         confirmAddSongBtn.innerText = "保存修改";
         showModal(addSongModal);
@@ -2732,6 +2879,7 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
         newSongTitle.value = '';
         newSongSub.value = '';
         newSongUrl.value = '';
+        _resetLocalUploadUI();
         modalTitleElem.innerText = "添加自定义歌曲";
         confirmAddSongBtn.innerText = "添加播放";
         showModal(addSongModal);
@@ -2933,10 +3081,9 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
                         if (songs.length > 0) {
                             currentIndex = realIndex % songs.length;
                             loadSong(currentIndex);
-                            if (isPlaying) audio.play();
                         } else {
                             audio.pause();
-                            isPlaying = false;
+                            _markPlaying(false);
                             loadSong(0);
                         }
                     } else if (realIndex < currentIndex) {
@@ -2948,9 +3095,7 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
             div.addEventListener('click', (e) => {
                 e.stopPropagation();
                 currentIndex = realIndex;
-                loadSong(currentIndex);
-                if (!isPlaying) togglePlay();
-                else audio.play();
+                loadSong(currentIndex, true);
             });
 
             container.appendChild(div);
@@ -2962,20 +3107,52 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
         if (contentDiv) renderListContent(contentDiv);
     }
 
-    confirmAddSongBtn.addEventListener('click', () => {
+    confirmAddSongBtn.addEventListener('click', async () => {
         const title = newSongTitle.value.trim();
         const sub = newSongSub.value.trim();
         const url = newSongUrl.value.trim();
 
-        if (!title || !url) {
-            showNotification('歌名和链接不能为空', 'error');
+        if (!title) {
+            showNotification('歌名不能为空', 'error');
+            return;
+        }
+
+        let finalUrl = null;
+
+        if (_pendingLocalFile) {
+            // 选了本地文件——上传到云端，拿到 oss:// 引用再存
+            if (!_cloudReady()) {
+                showNotification('未配置云端存储，无法上传本地音频', 'error');
+                return;
+            }
+            const originalBtnText = confirmAddSongBtn.innerText;
+            confirmAddSongBtn.innerText = '上传中…';
+            confirmAddSongBtn.disabled = true;
+            try {
+                const result = await window.CloudMedia.upload(_pendingLocalFile, 'music');
+                finalUrl = result.url; // 'oss://media/.../music/xxx.mp3'
+            } catch (e) {
+                showNotification('上传失败：' + (e && e.message || e), 'error');
+                confirmAddSongBtn.innerText = originalBtnText;
+                confirmAddSongBtn.disabled = false;
+                return;
+            }
+            confirmAddSongBtn.innerText = originalBtnText;
+            confirmAddSongBtn.disabled = false;
+        } else if (_editingCloudUrl) {
+            // 编辑模式：用户没重新选本地文件，也没填新链接——保留原来的云端引用不动
+            finalUrl = _editingCloudUrl;
+        } else if (url) {
+            finalUrl = url;
+        } else {
+            showNotification('请填写音频链接，或选择本地文件上传', 'error');
             return;
         }
 
         const songData = {
             title,
             sub: sub || '未知艺术家',
-            url,
+            url: finalUrl,
             isCustom: true
         };
 
@@ -2993,10 +3170,12 @@ const savedCover = safeGetItem(APP_PREFIX + 'playerCover');
         newSongTitle.value = '';
         newSongSub.value = '';
         newSongUrl.value = '';
+        _resetLocalUploadUI();
         hideModal(addSongModal);
     });
 
     cancelAddSongBtn.addEventListener('click', () => {
+        _resetLocalUploadUI();
         hideModal(addSongModal);
     });
 
@@ -3120,8 +3299,15 @@ playlist.style.top = (rect.top + (player.classList.contains('collapsed') ? 65 : 
             DOMElements.chatContainer.addEventListener('scroll', () => {
                 const container = DOMElements.chatContainer;
                 if (!container) return;
-                if (container.scrollTop < 50 && !isLoadingHistory && messages.length > displayedMessageCount) {
+                const hasMoreOlder = msgViewMode === 'window' ? msgWinStart > 0 : (messages.length > displayedMessageCount);
+                if (container.scrollTop < 50 && !isLoadingHistory && hasMoreOlder) {
                     if (typeof loadMoreHistory === 'function') loadMoreHistory();
+                }
+                if (msgViewMode === 'window' && !isLoadingFuture && msgWinEnd < messages.length) {
+                    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+                    if (distanceFromBottom < 50) {
+                        if (typeof loadMoreFuture === 'function') loadMoreFuture();
+                    }
                 }
             });
 

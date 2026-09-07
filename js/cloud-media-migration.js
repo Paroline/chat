@@ -14,6 +14,7 @@
  *   - 陪伴媒体（companionData.backgrounds/voices/noises）→ 云端引用
  *   - 收藏语音（favAudio_*）→ 云端引用（旧键名 + 旧格式 base64 全覆盖）
  *   - 聊天图片（chatMessages[].image）→ 云端引用（base64 替换，消息内容不变）
+ *   - 问卷选项图片（surveyData.askPartner[].questions[].options[].value）→ 云端引用
  */
 (function (global) {
     'use strict';
@@ -171,6 +172,26 @@
         _notify();
     }
 
+    // 跟 _migrateSingleImage 几乎一样，区别是这个不拼 sid——给"不分账号、全局共享"的
+    // 单值图片key用（目前只有通话背景图这一个），key本身就是完整的、调用方直接传全key
+    async function _migrateGlobalSingleImage(fullKey, category, label) {
+        var bg = await localforage.getItem(fullKey);
+        if (!_isBase64Image(bg)) return;
+
+        _state.currentTask = label;
+        _notify();
+        try {
+            var r = await window.CloudMedia.upload(bg, category);
+            await localforage.setItem(fullKey, r.url);
+            _state.completed++;
+        } catch (e) {
+            console.warn('[migration] ' + label + '上传失败', e);
+            _state.failed++;
+        }
+        _state.progress++;
+        _notify();
+    }
+
     // ==== 贴纸库迁移（字符串数组）====
     async function _migrateStickerArray(sid, keySuffix, category, label) {
         var key = APP_PREFIX_STR + sid + '_' + keySuffix;
@@ -187,21 +208,31 @@
         var newArr = [];
         for (var i = 0; i < arr.length; i++) {
             var item = arr[i];
-            if (typeof item !== 'string' || item.indexOf('oss://') === 0) {
+            // "我的表情库"现在是 {id, src, groupId, addedAt} 对象（为了支持分组），
+            // "对方表情库"还是纯字符串——这里兼容两种形状，取到实际要判断/上传的字符串值
+            var isObjShape = item && typeof item === 'object' && typeof item.src === 'string';
+            var rawStr = isObjShape ? item.src : item;
+
+            if (typeof rawStr !== 'string' || rawStr.indexOf('oss://') === 0) {
                 newArr.push(item);
                 continue;
             }
-            if (!_isBase64Image(item)) {
+            if (!_isBase64Image(rawStr)) {
                 newArr.push(item);
                 continue;
             }
             _state.currentTask = label + ' ' + (i + 1) + '/' + arr.length;
             _notify();
             try {
-                var r = await window.CloudMedia.upload(item, category);
-                newArr.push(r.url);
-                if (disabledSet && disabledSet.has(item)) {
-                    disabledSet.delete(item);
+                var r = await window.CloudMedia.upload(rawStr, category);
+                if (isObjShape) {
+                    item.src = r.url;
+                    newArr.push(item);
+                } else {
+                    newArr.push(r.url);
+                }
+                if (disabledSet && disabledSet.has(rawStr)) {
+                    disabledSet.delete(rawStr);
                     disabledSet.add(r.url);
                 }
                 _state.completed++;
@@ -411,6 +442,231 @@
         }
     }
 
+    // ==== 情侣空间壁纸迁移（csWallpaperGallery 存量 base64 → oss:// + 缩略图）====
+    //
+    // 跟其它迁移不太一样：壁纸库条目本来就可能已经有 cloudUrl（旧逻辑是"两份都存"），
+    // 这种情况不用重新上传，直接把 value 换成 cloudUrl 就行；只有真正没上传过的
+    // 纯本地 base64，才需要真正调用 CloudMedia.upload。同时要检查"当前壁纸"这个单值
+    // key，如果它跟某个刚迁移的条目内容一致，也要一起换成新地址。
+    async function _migrateCsWallpaper(sid) {
+        var galleryKey = APP_PREFIX_STR + sid + '_csWallpaperGallery';
+        var gallery;
+        try {
+            gallery = await localforage.getItem(galleryKey);
+        } catch (e) {
+            console.warn('[migration] 壁纸库：加载失败，跳过', e);
+            return;
+        }
+        if (!Array.isArray(gallery) || gallery.length === 0) return;
+
+        var currentKey = APP_PREFIX_STR + sid + '_csWallpaper';
+        var currentVal;
+        try { currentVal = await localforage.getItem(currentKey); } catch (e2) { currentVal = null; }
+
+        var changed = false;
+        for (var i = 0; i < gallery.length; i++) {
+            var bg = gallery[i];
+            if (!bg || typeof bg.value !== 'string') continue;
+            if (bg.value.indexOf('oss://') === 0) continue; // 已经是新格式
+
+            _state.currentTask = '情侣空间壁纸 ' + (i + 1) + '/' + gallery.length;
+            _notify();
+
+            var oldValue = bg.value;
+            var newUrl = null;
+
+            if (bg.cloudUrl && bg.cloudUrl.indexOf('oss://') === 0) {
+                // 旧逻辑已经上传过，只是本地还留着大图：不用重新传，直接切换引用
+                newUrl = bg.cloudUrl;
+                gallery[i] = { id: bg.id, type: bg.type, value: newUrl, thumbnail: bg.thumbnail || null, cloudKey: bg.cloudKey, cloudUrl: bg.cloudUrl };
+                changed = true;
+                _state.completed++;
+            } else if (_isBase64Image(bg.value)) {
+                // 从没上传过：真正传一次云端 + 补一张缩略图
+                try {
+                    var r = await window.CloudMedia.upload(bg.value, 'cs-wallpapers', bg.id);
+                    var thumb = bg.thumbnail || null;
+                    if (!thumb) {
+                        try { thumb = await window.CloudMedia.makeThumbnail(oldValue, 200); } catch (e3) {}
+                    }
+                    newUrl = r.url;
+                    gallery[i] = { id: bg.id, type: bg.type, value: newUrl, thumbnail: thumb, cloudKey: r.key, cloudUrl: r.url };
+                    changed = true;
+                    _state.completed++;
+                } catch (e4) {
+                    console.warn('[migration] 壁纸上传失败 id=' + bg.id, e4);
+                    _state.failed++;
+                }
+            }
+
+            // 当前壁纸如果正好是这一条，同步换成新地址
+            if (newUrl && typeof currentVal === 'string' && currentVal === oldValue) {
+                currentVal = newUrl;
+            }
+
+            _state.progress++;
+            _notify();
+        }
+
+        if (changed) {
+            try { await localforage.setItem(galleryKey, gallery); }
+            catch (e5) { console.error('[migration] 壁纸库写回失败', e5); throw e5; }
+            try { await localforage.setItem(currentKey, currentVal); }
+            catch (e6) { /* 当前壁纸写回失败不影响壁纸库本身，静默跳过 */ }
+
+            // 同步内存变量，防止旧逻辑把 base64 重新写回 localforage
+            try {
+                /* global _csBgGallery */
+                if (typeof _csBgGallery !== 'undefined' && Array.isArray(_csBgGallery)) {
+                    for (var gi = 0; gi < gallery.length; gi++) {
+                        if (_csBgGallery[gi] && gallery[gi] && gallery[gi].value.indexOf('oss://') === 0) {
+                            _csBgGallery[gi] = gallery[gi];
+                        }
+                    }
+                }
+            } catch (memErr) { /* 内存同步失败不影响 localforage 写入，静默跳过 */ }
+        }
+    }
+
+    // ==== 纪念日封面迁移（annCoverBg_* 每条纪念日各自一个 key，需先枚举）====
+    async function _migrateAnnCovers(sid) {
+        var prefix = APP_PREFIX_STR + sid + '_annCoverBg_';
+        var allKeys;
+        try {
+            allKeys = await localforage.keys();
+        } catch (e) {
+            console.warn('[migration] 纪念日封面：枚举 key 失败，跳过', e);
+            return;
+        }
+        var coverKeys = allKeys.filter(function (k) { return k.indexOf(prefix) === 0; });
+        for (var i = 0; i < coverKeys.length; i++) {
+            var key = coverKeys[i];
+            var val;
+            try {
+                val = await localforage.getItem(key);
+            } catch (e2) { continue; }
+            if (!_isBase64Image(val)) continue;
+
+            _state.currentTask = '纪念日封面 ' + (i + 1) + '/' + coverKeys.length;
+            _notify();
+            try {
+                var r = await window.CloudMedia.upload(val, 'ann-covers');
+                await localforage.setItem(key, r.url);
+                _state.completed++;
+            } catch (e3) {
+                console.warn('[migration] 纪念日封面上传失败 key=' + key, e3);
+                _state.failed++;
+            }
+            _state.progress++;
+            _notify();
+        }
+    }
+
+    // ==== 动态图片迁移（momentsData 里贴文配图 + 评论图片 base64 → oss://）====
+    //
+    // 分批处理，每批完成后立即写回 localforage 并同步内存变量（momentsData）。
+    // 逻辑跟聊天图片迁移一致：只搬"贴文的 images 数组"和"评论的 image 字段"，
+    // video/videoCover 发的时候就要求联网上传（失败直接置 null），本身不会是 base64，不用扫。
+    async function _migrateMomentsImages(sid) {
+        var key = APP_PREFIX_STR + sid + '_momentsData';
+        var data;
+        try {
+            data = await localforage.getItem(key);
+        } catch (loadErr) {
+            console.warn('[migration] 动态图片：加载 momentsData 失败，跳过', loadErr);
+            return;
+        }
+        if (!data || !Array.isArray(data.posts) || data.posts.length === 0) return;
+
+        // 找出所有需要迁移的图片位置：{ postIdx, kind: 'post'|'comment', imgIdx?, commentIdx? }
+        var toMigrate = [];
+        for (var pi = 0; pi < data.posts.length; pi++) {
+            var post = data.posts[pi];
+            if (!post) continue;
+            if (Array.isArray(post.images)) {
+                for (var ii = 0; ii < post.images.length; ii++) {
+                    if (_isBase64Image(post.images[ii])) {
+                        toMigrate.push({ postIdx: pi, kind: 'post', imgIdx: ii });
+                    }
+                }
+            }
+            if (Array.isArray(post.comments)) {
+                for (var ci = 0; ci < post.comments.length; ci++) {
+                    var cmt = post.comments[ci];
+                    if (cmt && _isBase64Image(cmt.image)) {
+                        toMigrate.push({ postIdx: pi, kind: 'comment', commentIdx: ci });
+                    }
+                }
+            }
+        }
+        if (toMigrate.length === 0) return;
+
+        for (var batchStart = 0; batchStart < toMigrate.length; batchStart += CHAT_IMAGE_BATCH_SIZE) {
+            var batchEnd = Math.min(batchStart + CHAT_IMAGE_BATCH_SIZE, toMigrate.length);
+            var batchChanged = false;
+
+            for (var j = batchStart; j < batchEnd; j++) {
+                var loc = toMigrate[j];
+                var post2 = data.posts[loc.postIdx];
+                _state.currentTask = '动态图片 ' + (j + 1) + '/' + toMigrate.length;
+                _notify();
+                try {
+                    if (loc.kind === 'post') {
+                        var srcImg = post2.images[loc.imgIdx];
+                        var r1 = await window.CloudMedia.upload(srcImg, 'moments-img');
+                        post2.images[loc.imgIdx] = r1.url;
+                    } else {
+                        var cmt2 = post2.comments[loc.commentIdx];
+                        var r2 = await window.CloudMedia.upload(cmt2.image, 'moments-comment-img');
+                        cmt2.image = r2.url;
+                    }
+                    batchChanged = true;
+                    _state.completed++;
+                } catch (e) {
+                    console.warn('[migration] 动态图片上传失败 postIdx=' + loc.postIdx, e);
+                    _state.failed++;
+                }
+                _state.progress++;
+                _notify();
+            }
+
+            if (batchChanged) {
+                try {
+                    await localforage.setItem(key, data);
+                } catch (saveErr) {
+                    console.error('[migration] 动态图片写回失败（第 ' + Math.floor(batchStart / CHAT_IMAGE_BATCH_SIZE + 1) + ' 批）', saveErr);
+                    throw saveErr;
+                }
+
+                // 同步内存变量 momentsData，防止 saveMomentsData() 把旧 base64 重新写回 localforage
+                try {
+                    /* global momentsData */
+                    if (typeof momentsData !== 'undefined' && momentsData && Array.isArray(momentsData.posts)) {
+                        for (var si = batchStart; si < batchEnd; si++) {
+                            var loc2 = toMigrate[si];
+                            var freshPost = data.posts[loc2.postIdx];
+                            var memPost = momentsData.posts[loc2.postIdx];
+                            if (!freshPost || !memPost) continue;
+                            if (loc2.kind === 'post') {
+                                if (freshPost.images && freshPost.images[loc2.imgIdx] && freshPost.images[loc2.imgIdx].indexOf('oss://') === 0) {
+                                    if (memPost.images) memPost.images[loc2.imgIdx] = freshPost.images[loc2.imgIdx];
+                                }
+                            } else {
+                                var freshCmt = freshPost.comments && freshPost.comments[loc2.commentIdx];
+                                var memCmt = memPost.comments && memPost.comments[loc2.commentIdx];
+                                if (freshCmt && memCmt && freshCmt.image && freshCmt.image.indexOf('oss://') === 0) {
+                                    memCmt.image = freshCmt.image;
+                                }
+                            }
+                        }
+                    }
+                } catch (memErr) {
+                    // 内存同步失败不影响 localforage 写入，静默跳过
+                }
+            }
+        }
+    }
+
     // ==== 扫描：计算总项数 ====
     async function _countTasks(sid) {
         var count = 0;
@@ -423,6 +679,10 @@
         // 聊天背景
         var cb = await localforage.getItem(APP_PREFIX_STR + sid + '_chatBackground');
         if (_isBase64Image(cb)) count++;
+
+        // 通话背景图（全局key，不分账号）
+        var callBg = await localforage.getItem(APP_PREFIX_STR + 'callBgImageData');
+        if (_isBase64Image(callBg)) count++;
 
         // 日记背景图库
         var dg = await localforage.getItem(APP_PREFIX_STR + sid + '_companionDiaryBgGallery');
@@ -440,7 +700,10 @@
         }
         var ml = await localforage.getItem(APP_PREFIX_STR + sid + '_myStickerLibrary');
         if (Array.isArray(ml)) {
-            ml.forEach(function (item) { if (_isBase64Image(item)) count++; });
+            ml.forEach(function (item) {
+                var raw = (item && typeof item === 'object') ? item.src : item;
+                if (_isBase64Image(raw)) count++;
+            });
         }
 
         // 陪伴媒体
@@ -482,7 +745,134 @@
             console.warn('[migration] 无法统计聊天图片数量（数据过大？），将在迁移时尝试处理', e);
         }
 
+        // 情侣空间壁纸库：value 还是 base64、或者有 cloudUrl 但本地还留着大图的，都算一条
+        try {
+            var wpGallery = await localforage.getItem(APP_PREFIX_STR + sid + '_csWallpaperGallery');
+            if (Array.isArray(wpGallery)) {
+                wpGallery.forEach(function (bg) {
+                    if (!bg || typeof bg.value !== 'string') return;
+                    if (bg.value.indexOf('oss://') === 0) return;
+                    if (_isBase64Image(bg.value) || (bg.cloudUrl && bg.cloudUrl.indexOf('oss://') === 0)) count++;
+                });
+            }
+        } catch (eWp) {
+            console.warn('[migration] 无法统计壁纸库数量', eWp);
+        }
+
+        // 纪念日封面：每条各自一个 key，需先枚举
+        try {
+            var annKeys = await localforage.keys();
+            var annPrefix = APP_PREFIX_STR + sid + '_annCoverBg_';
+            for (var aki = 0; aki < annKeys.length; aki++) {
+                if (annKeys[aki].indexOf(annPrefix) !== 0) continue;
+                var annVal = await localforage.getItem(annKeys[aki]);
+                if (_isBase64Image(annVal)) count++;
+            }
+        } catch (eAnn) {
+            console.warn('[migration] 无法统计纪念日封面数量', eAnn);
+        }
+
+        // 动态图片：贴文配图 + 评论图片
+        try {
+            var md = await localforage.getItem(APP_PREFIX_STR + sid + '_momentsData');
+            if (md && Array.isArray(md.posts)) {
+                md.posts.forEach(function (post) {
+                    if (!post) return;
+                    if (Array.isArray(post.images)) {
+                        post.images.forEach(function (img) { if (_isBase64Image(img)) count++; });
+                    }
+                    if (Array.isArray(post.comments)) {
+                        post.comments.forEach(function (cmt) { if (cmt && _isBase64Image(cmt.image)) count++; });
+                    }
+                });
+            }
+        } catch (e2) {
+            console.warn('[migration] 无法统计动态图片数量（数据过大？），将在迁移时尝试处理', e2);
+        }
+
+        // 问卷选项图片（"我问梦角"里图片类型选项的存量 base64）
+        try {
+            var sv = await localforage.getItem(APP_PREFIX_STR + sid + '_surveyData');
+            if (sv && Array.isArray(sv.askPartner)) {
+                sv.askPartner.forEach(function (survey) {
+                    if (!survey || !Array.isArray(survey.questions)) return;
+                    survey.questions.forEach(function (q) {
+                        if (!q || !Array.isArray(q.options)) return;
+                        q.options.forEach(function (opt) {
+                            if (opt && opt.kind === 'image' && _isBase64Image(opt.value)) count++;
+                        });
+                    });
+                });
+            }
+        } catch (eSv) {
+            console.warn('[migration] 无法统计问卷选项图片数量', eSv);
+        }
+
         return count;
+    }
+
+    // ==== 问卷选项图片迁移（"我问梦角"问卷里图片类型选项的存量 base64 → oss://）====
+    async function _migrateSurveyOptionImages(sid) {
+        var key = APP_PREFIX_STR + sid + '_surveyData';
+        var data;
+        try {
+            data = await localforage.getItem(key);
+        } catch (loadErr) {
+            console.warn('[migration] 问卷选项图片：加载 surveyData 失败，跳过', loadErr);
+            return;
+        }
+        if (!data || !Array.isArray(data.askPartner) || !data.askPartner.length) return;
+
+        var toMigrate = [];
+        data.askPartner.forEach(function (survey, si) {
+            if (!survey || !Array.isArray(survey.questions)) return;
+            survey.questions.forEach(function (q, qi) {
+                if (!q || !Array.isArray(q.options)) return;
+                q.options.forEach(function (opt, oi) {
+                    if (opt && opt.kind === 'image' && _isBase64Image(opt.value)) {
+                        toMigrate.push({ si: si, qi: qi, oi: oi });
+                    }
+                });
+            });
+        });
+        if (!toMigrate.length) return;
+
+        var changed = false;
+        for (var i = 0; i < toMigrate.length; i++) {
+            var loc = toMigrate[i];
+            var opt = data.askPartner[loc.si].questions[loc.qi].options[loc.oi];
+            _state.currentTask = '问卷选项图片 ' + (i + 1) + '/' + toMigrate.length;
+            _notify();
+            try {
+                var r = await window.CloudMedia.upload(opt.value, 'survey-options');
+                opt.value = r.url;
+                changed = true;
+                _state.completed++;
+            } catch (e) {
+                console.warn('[migration] 问卷选项图片上传失败', loc, e);
+                _state.failed++;
+            }
+            _state.progress++;
+            _notify();
+        }
+
+        if (changed) {
+            try {
+                await localforage.setItem(key, data);
+            } catch (saveErr) {
+                console.error('[migration] 问卷选项图片写回失败', saveErr);
+                throw saveErr;
+            }
+            // survey.js 自己维护一份内存里的 _data，不重新加载一下的话，
+            // 之后它随便调一次 _save() 就会把刚迁移好的云端地址覆盖回旧 base64
+            try {
+                if (typeof window._surveyReloadFromStorage === 'function') {
+                    await window._surveyReloadFromStorage();
+                }
+            } catch (syncErr) {
+                console.warn('[migration] 问卷模块内存同步失败（不影响已写入的迁移结果）', syncErr);
+            }
+        }
     }
 
     // ==== 主入口 ====
@@ -521,9 +911,25 @@
             await _migrateObjectGallery(sid, 'backgroundGallery', 'backgrounds', '背景图库');
             await _migrateSingleImage(sid, 'chatBackground', 'backgrounds', '当前聊天背景');
 
+            // 通话背景图（全局key，不分账号，用专门的不拼sid版本迁移）
+            await _migrateGlobalSingleImage(APP_PREFIX_STR + 'callBgImageData', 'call-backgrounds', '通话背景图');
+            try {
+                if (typeof window._refreshCallBgFromStorage === 'function') {
+                    await window._refreshCallBgFromStorage();
+                }
+            } catch (eCallBg) {
+                console.warn('[migration] 通话背景内存同步失败（不影响已写入的迁移结果）', eCallBg);
+            }
+
             // 日记背景
             await _migrateObjectGallery(sid, 'companionDiaryBgGallery', 'diary-backgrounds', '日记背景图库');
             await _migrateSingleImage(sid, 'companionDiaryBg', 'diary-backgrounds', '当前日记背景');
+
+            // 情侣空间壁纸（存量大图搬去云端，本地只留缩略图）
+            await _migrateCsWallpaper(sid);
+
+            // 纪念日封面（枚举所有 annCoverBg_* key）
+            await _migrateAnnCovers(sid);
 
             // 贴纸（写 localforage 后同步内存变量）
             await _migrateStickerArray(sid, 'stickerLibrary', 'stickers', '对方表情库');
@@ -537,6 +943,12 @@
 
             // 聊天图片（分批，每批同步内存变量）
             await _migrateChatImages(sid);
+
+            // 动态图片（贴文配图 + 评论图片，分批，每批同步内存变量）
+            await _migrateMomentsImages(sid);
+
+            // 问卷选项图片（"我问梦角"里图片类型选项的存量 base64）
+            await _migrateSurveyOptionImages(sid);
 
             _state.currentTask = '完成';
             _notify();
